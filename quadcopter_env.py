@@ -44,9 +44,9 @@ class GateCourseRandomizer:
         num_gates_range=(4, 6),
         gate_size_range=(0.8, 1.5),
         segment_length_range=(3.0, 6.0),
-        lateral_swing_range=(2.0, 5.0),
-        ground_height_range=(1.0, 1.8),
-        elevated_height_range=(2.5, 3.5),
+        lateral_swing_range=(0.5, 1.5),
+        ground_height_range=(1.5, 2.0),
+        elevated_height_range=(2.4, 3.0),
         elevated_gate_fraction=0.25,
     ):
         self.num_envs = num_envs
@@ -131,7 +131,11 @@ def check_gate_passed(drone_pos, drone_prev_pos, gate_pos, gate_heading, gate_si
     z_diff = (drone_pos[:, 2] - gate_pos[:, 2]).abs()
     within_height = z_diff < (gate_size / 2)
 
-    return crossed_plane & within_bounds & within_height
+    offset_norm = torch.maximum(
+        lateral.norm(dim=-1) / (gate_size / 2),
+        z_diff / (gate_size / 2),
+    )
+    return (crossed_plane & within_bounds & within_height), offset_norm
 
 
 class QuadcopterGateRaceEnvWindow(BaseEnvWindow):
@@ -203,15 +207,16 @@ class QuadcopterGateRaceEnvCfg(DirectRLEnvCfg):
     ang_vel_reward_scale = -0.01
     distance_to_gate_reward_scale = 15.0
     action_penalty_scale = 0.0
-    gate_pass_bonus = 10.0
+    centering_weight = 0.0
+    gate_pass_bonus = 60.0
 
     # gate course randomization params
     num_gates_range = (4, 6)
     gate_size_range = (0.8, 1.5)
     segment_length_range = (3.0, 6.0)
-    lateral_swing_range = (2.0, 5.0)
-    ground_height_range = (1.0, 1.8)
-    elevated_height_range = (2.5, 3.5)
+    lateral_swing_range = (0.5, 1.5)
+    ground_height_range = (1.5, 2.0)
+    elevated_height_range = (2.4, 3.0)
 
 
 class QuadcopterGateRaceEnv(DirectRLEnv):
@@ -329,10 +334,11 @@ class QuadcopterGateRaceEnv(DirectRLEnv):
         prev_distance_to_gate = torch.linalg.norm(gate_pos_w - self._prev_root_pos_w, dim=1)
         progress_to_gate = prev_distance_to_gate - distance_to_gate
 
-        just_passed = check_gate_passed(
+        just_passed, offset_norm = check_gate_passed(
             root_pos_w, self._prev_root_pos_w, gate_pos_w, gate_heading, self._gate_size
         )
-        gate_pass_bonus = just_passed.float() * self.cfg.gate_pass_bonus
+        centering_quality = (1.0 - self.cfg.centering_weight * offset_norm).clamp(min=0.0)
+        gate_pass_bonus = just_passed.float() * self.cfg.gate_pass_bonus * centering_quality
 
         self._current_gate_idx = torch.where(
             just_passed, self._current_gate_idx + 1, self._current_gate_idx
@@ -355,11 +361,11 @@ class QuadcopterGateRaceEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
-        crashed = torch.logical_or(
-            self._robot.data.root_pos_w[:, 2] < 0.1, self._robot.data.root_pos_w[:, 2] > 4.0
-        )
-        finished_course = self._current_gate_idx >= self._num_gates
-        died = torch.logical_or(crashed, finished_course)
+        self._term_floor = self._robot.data.root_pos_w[:, 2] < 0.1
+        self._term_ceiling = self._robot.data.root_pos_w[:, 2] > 5.0
+        crashed = torch.logical_or(self._term_floor, self._term_ceiling)
+        self._term_finished = self._current_gate_idx >= self._num_gates
+        died = torch.logical_or(crashed, self._term_finished)
         return died, time_out
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
@@ -381,6 +387,10 @@ class QuadcopterGateRaceEnv(DirectRLEnv):
         extras["Episode_Termination/time_out"] = torch.count_nonzero(self.reset_time_outs[env_ids]).item()
         extras["Metrics/final_distance_to_gate"] = final_distance_to_gate.item()
         extras["Metrics/gates_passed"] = torch.mean(self._current_gate_idx[env_ids].float()).item()
+        if hasattr(self, "_term_floor"):
+            extras["Metrics/term_floor"] = torch.count_nonzero(self._term_floor[env_ids]).item()
+            extras["Metrics/term_ceiling"] = torch.count_nonzero(self._term_ceiling[env_ids]).item()
+            extras["Metrics/term_finished"] = torch.count_nonzero(self._term_finished[env_ids]).item()
         self.extras["log"].update(extras)
 
         self._robot.reset(env_ids)

@@ -30,7 +30,7 @@ class QuadcopterPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=5.0e-4,
-        schedule="fixed",
+        schedule="adaptive",
         gamma=0.99,
         lam=0.95,
         desired_kl=0.01,
