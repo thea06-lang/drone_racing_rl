@@ -19,18 +19,20 @@
 from __future__ import annotations
 
 import gymnasium as gym
+import os
+import numpy as np
 import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation, ArticulationCfg
-from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
+from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg, ViewerCfg
 from isaaclab.envs.ui import BaseEnvWindow
-from isaaclab.markers import VisualizationMarkers
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import subtract_frame_transforms
+from isaaclab.utils.math import quat_apply_inverse, quat_from_euler_xyz, subtract_frame_transforms
 
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 from isaaclab.markers import CUBOID_MARKER_CFG  # isort: skip
@@ -93,15 +95,25 @@ class GateCourseRandomizer:
             elevated_h = torch.empty(n, device=device).uniform_(*self.elevated_height_range)
             gate_positions[:, i, 2] = torch.where(elevated_roll, elevated_h, ground_h)
 
+        # FIX (Ben): gate faces the BISECTOR of incoming + outgoing direction.
+        # Before, it faced only the NEXT gate, so on a serpentine the drone often
+        # had to cross the gate plane at a steep angle (the "hairpin" problem).
+        def _unit(v):
+            return v / v.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+
+        start_xy = torch.zeros(n, 2, device=device)
         for i in range(max_gates):
-            next_i = min(i + 1, max_gates - 1)
-            delta = gate_positions[:, next_i, :2] - gate_positions[:, i, :2]
-            safe_delta = torch.where(
-                delta.norm(dim=-1, keepdim=True) > 1e-3,
-                delta,
-                torch.tensor([1.0, 0.0], device=device),
-            )
-            gate_headings[:, i] = torch.atan2(safe_delta[:, 1], safe_delta[:, 0])
+            prev_xy = start_xy if i == 0 else gate_positions[:, i - 1, :2]
+            here_xy = gate_positions[:, i, :2]
+            incoming = _unit(here_xy - prev_xy)
+            if i < max_gates - 1:
+                outgoing = _unit(gate_positions[:, i + 1, :2] - here_xy)
+                is_last = (i == num_gates - 1).unsqueeze(-1)
+                outgoing = torch.where(is_last, incoming, outgoing)  # last real gate: no next gate
+            else:
+                outgoing = incoming
+            direction = _unit(incoming + outgoing)
+            gate_headings[:, i] = torch.atan2(direction[:, 1], direction[:, 0])
 
         gate_size = torch.empty(n, device=device).uniform_(*self.gate_size_range)
 
@@ -155,9 +167,18 @@ class QuadcopterGateRaceEnvCfg(DirectRLEnvCfg):
     episode_length_s = 20.0  # longer than stock (10s) -- multi-gate course needs more time
     decimation = 2
     action_space = 4
-    observation_space = 15  # stock 12, with desired_pos_b swapped for gate_pos_b (3) + gate_heading sin/cos (2) + gate_idx_norm (1)
+    observation_space = 19  # NEW (Ben v4): +own height (1) +next gate position (3); was  # stock 12, with desired_pos_b swapped for gate_pos_b (3) + gate_heading sin/cos (2) + gate_idx_norm (1)
     state_space = 0
     debug_vis = True
+
+    # NEW (Ben): camera follows drone of env 0 -> used by the GUI AND recorded videos
+    viewer: ViewerCfg = ViewerCfg(
+        eye=(-4.0, -2.0, 2.5),
+        lookat=(2.0, 0.0, 0.0),
+        origin_type="asset_root",
+        asset_name="robot",
+        env_index=0,
+    )
 
     ui_window_class_type = QuadcopterGateRaceEnvWindow
 
@@ -187,7 +208,8 @@ class QuadcopterGateRaceEnvCfg(DirectRLEnvCfg):
     )
 
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=4096, env_spacing=2.5, replicate_physics=True, clone_in_fabric=True
+        num_envs=4096, env_spacing=40.0,  # was 2.5: courses are up to ~36 m long, so envs overlapped visually
+        replicate_physics=True, clone_in_fabric=True
     )
 
     robot: ArticulationCfg = CRAZYFLIE_CFG.replace(
@@ -209,12 +231,14 @@ class QuadcopterGateRaceEnvCfg(DirectRLEnvCfg):
     action_penalty_scale = 0.0
     centering_weight = 0.0
     gate_pass_bonus = 60.0
+    crash_penalty = -150.0  # NEW (Ben v2): crashing used to cost nothing
+    alive_reward_scale = 2.0  # NEW (Ben v4): +2 per second survived
 
     # gate course randomization params
     num_gates_range = (4, 6)
     gate_size_range = (0.8, 1.5)
     segment_length_range = (3.0, 6.0)
-    lateral_swing_range = (0.5, 1.5)
+    lateral_swing_range = (0.3, 1.0)  # NEW (Ben v4): gentler zigzag to start (was 0.5-1.5)
     ground_height_range = (1.5, 2.0)
     elevated_height_range = (2.4, 3.0)
 
@@ -257,6 +281,8 @@ class QuadcopterGateRaceEnv(DirectRLEnv):
                 "distance_to_gate",
                 "gate_pass_bonus",
                 "action_penalty",
+                "crash",
+                "alive",
             ]
         }
 
@@ -266,6 +292,13 @@ class QuadcopterGateRaceEnv(DirectRLEnv):
         self._robot_weight = (self._robot_mass * self._gravity_magnitude).item()
 
         self.set_debug_vis(self.cfg.debug_vis)
+
+        # NEW (Ben v3): flight recorder for env 0, only on when DRONE_LOG_DIR is set
+        self._log_dir = os.environ.get("DRONE_LOG_DIR")
+        self._log_traj = []
+        self._log_saved = 0
+        if self._log_dir:
+            os.makedirs(self._log_dir, exist_ok=True)
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
@@ -309,15 +342,32 @@ class QuadcopterGateRaceEnv(DirectRLEnv):
             self._current_gate_idx.float() / max(self.cfg.num_gates_range[1] - 1, 1)
         ).unsqueeze(-1)
 
+        # FIX (Ben): gate direction was given in WORLD frame, but the policy never
+        # sees its own yaw (projected_gravity has no yaw info), so world cos/sin
+        # was meaningless to it. Rotate the gate normal into the BODY frame.
+        gate_normal_w = torch.stack(
+            [torch.cos(gate_heading), torch.sin(gate_heading), torch.zeros_like(gate_heading)], dim=-1
+        )
+        gate_normal_b = quat_apply_inverse(self._robot.data.root_quat_w, gate_normal_w)
+
+        # NEW (Ben v4): show the drone the NEXT gate (to plan turns) and its own height (to see the floor)
+        all_ids = torch.arange(self.num_envs, device=self.device)
+        next_idx = (self._current_gate_idx + 1).clamp(max=self.cfg.num_gates_range[1] - 1)
+        next_gate_pos_b, _ = subtract_frame_transforms(
+            self._robot.data.root_pos_w, self._robot.data.root_quat_w, self._gate_positions_w[all_ids, next_idx]
+        )
+        height = self._robot.data.root_pos_w[:, 2:3]
+
         obs = torch.cat(
             [
                 self._robot.data.root_lin_vel_b,
                 self._robot.data.root_ang_vel_b,
                 self._robot.data.projected_gravity_b,
                 gate_pos_b,
-                torch.cos(gate_heading).unsqueeze(-1),
-                torch.sin(gate_heading).unsqueeze(-1),
+                gate_normal_b[:, :2],  # same 2 slots as before -> observation_space stays 15
                 gate_idx_norm,
+                next_gate_pos_b,  # NEW (Ben v4)
+                height,  # NEW (Ben v4)
             ],
             dim=-1,
         )
@@ -350,11 +400,20 @@ class QuadcopterGateRaceEnv(DirectRLEnv):
             "distance_to_gate": progress_to_gate * self.cfg.distance_to_gate_reward_scale,
             "action_penalty": torch.sum(self._actions[:, 1:] ** 2, dim=1) * self.cfg.action_penalty_scale,
             "gate_pass_bonus": gate_pass_bonus,
+            # NEW (Ben v2): one-time penalty on the step the drone hits floor/ceiling
+            "alive": torch.full((self.num_envs,), self.cfg.alive_reward_scale * self.step_dt, device=self.device),  # NEW (Ben v4)
+            "crash": (self._term_floor | self._term_ceiling).float() * self.cfg.crash_penalty
+            if hasattr(self, "_term_floor")
+            else torch.zeros(self.num_envs, device=self.device),
         }
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
 
         for key, value in rewards.items():
             self._episode_sums[key] += value
+
+        if self._log_dir and self._log_saved < 20:  # NEW (Ben v3): record env 0 each step
+            p = (root_pos_w[0] - self._terrain.env_origins[0]).detach().cpu().numpy()
+            self._log_traj.append([p[0], p[1], p[2], float(self._current_gate_idx[0])])
 
         self._prev_root_pos_w = root_pos_w.clone()
         return reward
@@ -400,6 +459,25 @@ class QuadcopterGateRaceEnv(DirectRLEnv):
 
         self._actions[env_ids] = 0.0
 
+        # NEW (Ben v3): save env 0's finished episode before a new course is drawn
+        if self._log_dir and len(self._log_traj) > 1 and bool((env_ids == 0).any()):
+            n = int(self._num_gates[0])
+            origin = self._terrain.env_origins[0]
+            crashed = bool(self._term_floor[0] | self._term_ceiling[0]) if hasattr(self, "_term_floor") else False
+            np.savez(
+                os.path.join(self._log_dir, f"episode_{self._log_saved:03d}.npz"),
+                traj=np.array(self._log_traj, dtype=np.float32),
+                gates=(self._gate_positions_w[0, :n] - origin).cpu().numpy(),
+                headings=self._gate_headings[0, :n].cpu().numpy(),
+                gate_size=float(self._gate_size[0]),
+                gates_passed=int(self._current_gate_idx[0]),
+                crashed=crashed,
+                dt=float(self.step_dt),
+            )
+            print(f"[flight recorder] saved episode {self._log_saved}: {int(self._current_gate_idx[0])}/{n} gates, crashed={crashed}")
+            self._log_saved += 1
+            self._log_traj = []
+
         course = self._randomizer.sample_course(env_ids)
         self._num_gates[env_ids] = course["num_gates"]
         self._gate_positions_w[env_ids] = course["gate_positions"] + self._terrain.env_origins[env_ids].unsqueeze(1)
@@ -419,17 +497,53 @@ class QuadcopterGateRaceEnv(DirectRLEnv):
         self._prev_root_pos_w[env_ids] = default_root_state[:, :3]
 
     def _set_debug_vis_impl(self, debug_vis: bool):
+        # NEW (Ben): draw every gate as a see-through panel.
+        # green = gate it's flying to now, orange = upcoming, grey = already passed
         if debug_vis:
-            if not hasattr(self, "goal_pos_visualizer"):
-                marker_cfg = CUBOID_MARKER_CFG.copy()
-                marker_cfg.markers["cuboid"].size = (0.05, 0.05, 0.05)
-                marker_cfg.prim_path = "/Visuals/Command/current_gate_position"
-                self.goal_pos_visualizer = VisualizationMarkers(marker_cfg)
-            self.goal_pos_visualizer.set_visibility(True)
+            if not hasattr(self, "gate_visualizer"):
+                def _panel(color, opacity):
+                    return sim_utils.CuboidCfg(
+                        size=(0.05, 1.0, 1.0),  # thin along gate normal; scaled by gate_size at draw time
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color, opacity=opacity),
+                    )
+
+                gate_cfg = VisualizationMarkersCfg(
+                    prim_path="/Visuals/Gates",
+                    markers={
+                        "current": _panel((0.1, 1.0, 0.2), 0.6),
+                        "upcoming": _panel((1.0, 0.5, 0.1), 0.35),
+                        "passed": _panel((0.5, 0.5, 0.5), 0.15),
+                    },
+                )
+                self.gate_visualizer = VisualizationMarkers(gate_cfg)
+            self.gate_visualizer.set_visibility(True)
         else:
-            if hasattr(self, "goal_pos_visualizer"):
-                self.goal_pos_visualizer.set_visibility(False)
+            if hasattr(self, "gate_visualizer"):
+                self.gate_visualizer.set_visibility(False)
 
     def _debug_vis_callback(self, event):
-        gate_pos_w, gate_heading = self._current_gate_pos_heading()
-        self.goal_pos_visualizer.visualize(gate_pos_w)
+        n, g = self._gate_positions_w.shape[:2]
+        gate_ids = torch.arange(g, device=self.device).unsqueeze(0).expand(n, g)
+
+        pos = self._gate_positions_w.clone()
+        exists = gate_ids < self._num_gates.unsqueeze(-1)
+        pos[~exists] = torch.tensor([0.0, 0.0, -100.0], device=self.device)  # hide unused gate slots underground
+
+        yaw = self._gate_headings.reshape(-1)
+        zeros = torch.zeros_like(yaw)
+        quat = quat_from_euler_xyz(zeros, zeros, yaw)
+
+        size = self._gate_size.unsqueeze(-1).expand(n, g).reshape(-1)
+        scales = torch.stack([torch.ones_like(size), size, size], dim=-1)
+
+        cur = self._current_gate_idx.unsqueeze(-1)
+        idx = torch.full((n, g), 1, dtype=torch.long, device=self.device)  # upcoming
+        idx[gate_ids == cur] = 0  # current
+        idx[gate_ids < cur] = 2  # passed
+
+        self.gate_visualizer.visualize(
+            translations=pos.reshape(-1, 3),
+            orientations=quat,
+            scales=scales,
+            marker_indices=idx.reshape(-1),
+        )
