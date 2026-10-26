@@ -225,14 +225,15 @@ class QuadcopterGateRaceEnvCfg(DirectRLEnvCfg):
 
     # reward scales -- lin_vel/ang_vel kept identical to stock (smoothness);
     # distance_to_goal replaced conceptually by distance_to_gate
-    lin_vel_reward_scale = -0.05
-    ang_vel_reward_scale = -0.01
+    lin_vel_reward_scale = -0.01  # Ben v6: was -0.05
+    ang_vel_reward_scale = -0.05  # Ben v7: was -0.01, smoother turns (less overshoot/loops)
+    spawn_height = 1.2  # Ben v7: start higher (was 0.5 m, too close to the 0.1 m floor limit)
     distance_to_gate_reward_scale = 15.0
     action_penalty_scale = 0.0
-    centering_weight = 0.0
+    centering_weight = 0.6  # Ben v6: centre pass = full bonus
     gate_pass_bonus = 60.0
     crash_penalty = -150.0  # NEW (Ben v2): crashing used to cost nothing
-    alive_reward_scale = 2.0  # NEW (Ben v4): +2 per second survived
+    alive_reward_scale = -1.0  # Ben v6: now a clock, -1 per second (was +2)
 
     # gate course randomization params
     num_gates_range = (4, 6)
@@ -490,6 +491,7 @@ class QuadcopterGateRaceEnv(DirectRLEnv):
         joint_vel = self._robot.data.default_joint_vel[env_ids]
         default_root_state = self._robot.data.default_root_state[env_ids]
         default_root_state[:, :3] += self._terrain.env_origins[env_ids]
+        default_root_state[:, 2] = self._terrain.env_origins[env_ids, 2] + self.cfg.spawn_height  # Ben v7
         self._robot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(default_root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
